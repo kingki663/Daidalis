@@ -30,8 +30,11 @@ try {
   const page = await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error => errors.push(error.message));
   await page.goto('http://127.0.0.1:' + server.address().port);await page.waitForFunction(() => window.ready);
   assert.ok(await page.locator('.semantic-node').count() > 10);
+  assert.equal(await page.locator('[data-document-filter]').inputValue(),'structure');
+  assert.equal(await page.locator('[data-document-filter] option[value="interconnection"]').count(),0);
+  await page.waitForFunction(() => document.querySelector('.semantic-label').getScreenCTM().a >= 1);
   await page.locator('[data-document-fit]').click();
-  await page.locator('.semantic-node').first().click();assert.match(await page.locator('.semantic-details').innerText(),/类型/);
+  await page.locator('.semantic-node').first().locator('.semantic-label').first().click();assert.match(await page.locator('.semantic-details').innerText(),/selectedMission[\s\S]*类型/);
   const before = await page.locator('.semantic-svg').getAttribute('viewBox');await page.locator('[data-document-zoom="in"]').click();assert.notEqual(await page.locator('.semantic-svg').getAttribute('viewBox'),before);await page.locator('[data-document-fit]').click();assert.equal(await page.locator('.semantic-svg').getAttribute('viewBox'),before);
   await page.locator('[data-document-filter]').selectOption('requirements');assert.match(await page.locator('.semantic-svg').textContent(),/requirement/);
   await page.screenshot({path:path.join(temporary,'model.png')});steps.push('real semantic model diagram, element details, filter and zoom');
@@ -51,12 +54,14 @@ try {
     }
     part system {
         part sensor : Device;
-        part uart : Device;
-        part flightSoftware : Device;
+        part processing {
+            part uart : Device;
+            part flightSoftware : Device;
+        }
         part estimator : Device;
-        connection sensorToUart connect sensor.output to uart.input;
-        connection uartToSoftware connect uart.output to flightSoftware.input;
-        connection softwareToEstimator connect flightSoftware.output to estimator.input;
+        connection sensorToUart connect sensor.output to processing.uart.input;
+        connection uartToSoftware connect processing.uart.output to processing.flightSoftware.input;
+        connection softwareToEstimator connect processing.flightSoftware.output to estimator.input;
     }
 }`;
   const args = {projectId:project.id,path:modelPath}, imported = await service.importModel({...args,content:generated});
@@ -68,8 +73,18 @@ try {
   const generatedFixture = await readGenerated();
   await fs.writeFile(path.join(temporary,'generated-model.json'),JSON.stringify(generatedFixture,null,2));
   await page.evaluate(options => viewer.update(options),generatedFixture);
-  assert.ok(await page.locator('.semantic-edge-composition').count() > 0);
-  await page.locator('[data-document-filter]').selectOption('interconnection');
+  assert.equal(await page.locator('.semantic-container').count(),2);
+  assert.equal(await page.locator('.semantic-edge-typing,.semantic-edge-composition').count(),0);
+  const bounds = await page.locator('.semantic-node').evaluateAll(elements => elements.map(element => {
+    const rect = element.querySelector('rect').getBoundingClientRect();
+    return {id:element.dataset.documentElement,parent:element.dataset.documentParent,port:element.classList.contains('semantic-endpoint'),left:rect.left,right:rect.right,top:rect.top,bottom:rect.bottom};
+  }));
+  for (const node of bounds) {
+    const parent = bounds.find(item => item.id === node.parent);if(!parent)continue;
+    assert.ok(node.top > parent.top && node.bottom < parent.bottom);
+    if (node.port) assert.ok(Math.min(Math.abs((node.left + node.right)/2 - parent.left),Math.abs((node.left + node.right)/2 - parent.right)) < 1);
+    else assert.ok(node.left > parent.left && node.right < parent.right);
+  }
   await page.locator('[data-document-fit]').click();
   assert.equal(await page.locator('.semantic-edge-connect').count(),3);
   assert.equal(await page.locator('.semantic-edge-connect [marker-end],.semantic-edge-connect [marker-start]').count(),0);
@@ -77,17 +92,19 @@ try {
   const uartInput = endpoints.find(node => node.label.startsWith('uart : Device') && node.label.endsWith('input : Signal'));
   const softwareInput = endpoints.find(node => node.label.startsWith('flightSoftware : Device') && node.label.endsWith('input : Signal'));
   assert.ok(uartInput);assert.ok(softwareInput);assert.notEqual(uartInput.id,softwareInput.id);
-  for (const [name,line] of [['sensorToUart',12],['uartToSoftware',13],['softwareToEstimator',14]]) {
+  for (const [name,line] of [['sensorToUart',14],['uartToSoftware',15],['softwareToEstimator',16]]) {
     const edge = page.locator('.semantic-edge-connect').filter({has:page.locator('text', {hasText:new RegExp('^' + name + '$')})});
     await edge.locator('text').click();
     assert.match(await page.locator('.semantic-details').innerText(),new RegExp(name + '[\\s\\S]*ConnectionUsage'));
     assert.equal(await page.locator('.semantic-details [data-document-source-line]').getAttribute('data-document-source-line'),String(line));
-    if (name === 'uartToSoftware') await page.screenshot({path:path.join(temporary,'interconnection.png')});
+    if (name === 'uartToSoftware') await page.screenshot({path:path.join(temporary,'combined-view.png')});
     await page.locator('.semantic-details [data-document-source-line]').click();
     assert.equal(await page.locator('.source-line.is-highlighted').getAttribute('data-source-line'),String(line));
     await page.locator('button[data-document-tab="diagram"]').click();await page.locator('[data-document-fit]').click();
   }
   await page.locator('.semantic-edge-connect').first().press('Enter');
+  assert.equal(await page.locator('.semantic-edge-connect.is-selected').count(),1);
+  await page.locator('.semantic-edge-connect').first().press(' ');
   assert.equal(await page.locator('.semantic-edge-connect.is-selected').count(),1);
   await page.locator(`.semantic-endpoint[data-document-element="${uartInput.id}"]`).click();
   assert.match(await page.locator('.semantic-details').innerText(),/所属元素[\s\S]*uart : Device/);
@@ -102,22 +119,35 @@ try {
   const canvas = await page.locator('.semantic-canvas').boundingBox();
   await page.mouse.move(canvas.x+8,canvas.y+8);await page.mouse.down();await page.mouse.move(canvas.x+70,canvas.y+50);await page.mouse.up();
   assert.notEqual(await page.locator('.semantic-svg').getAttribute('viewBox'),interconnectionBox);
-  await page.locator('[data-document-filter]').selectOption('structure');assert.ok(await page.locator('.semantic-edge-typing').count() > 0);
-  steps.push('generated model import, usage-port topology, edge details, keyboard selection, source navigation, search, drag and zoom');
-  const changed = generated.replace('part uart : Device;','part gateway : Device;').replaceAll('uart.input','gateway.input').replaceAll('uart.output','gateway.output').replace('connection sensorToUart connect sensor.output to gateway.input;','connection sensorToGateway connect gateway.input to sensor.output;');
+  await page.locator('[data-document-filter]').selectOption('all');assert.ok(await page.locator('.semantic-edge-typing').count() > 0);
+  await page.locator('[data-document-filter]').selectOption('structure');assert.equal(await page.locator('.semantic-container').count(),2);
+  steps.push('default combined view, nested composition, boundary ports, distinct usage identities, edge details, keyboard selection, source navigation, search, drag and zoom');
+  const changed = generated.replace('part uart : Device;','part gateway : Device;').replaceAll('uart.input','gateway.input').replaceAll('uart.output','gateway.output').replace('connection sensorToUart connect sensor.output to processing.gateway.input;','connection sensorToGateway connect processing.gateway.input to sensor.output;');
   const saved = await service.importModel({...args,content:changed,expectedHash:imported.model.sha256});
   assert.equal(saved.imported,true);assert.notEqual(saved.model.sha256,imported.model.sha256);
   const refreshed = await readGenerated();
-  await page.evaluate(options => viewer.update({...options,filter:'interconnection'}),refreshed);
+  await page.evaluate(options => viewer.update(options),refreshed);
   await page.locator('[data-document-fit]').click();
   assert.equal(await page.locator('.semantic-edge-connect').count(),3);
   assert.match(await page.locator('.semantic-svg').textContent(),/sensorToGateway/);
   assert.doesNotMatch(await page.locator('.semantic-svg').textContent(),/sensorToUart|uart : Device/);
   assert.equal(await page.locator('.semantic-edge-connect [marker-end],.semantic-edge-connect [marker-start]').count(),0);
   assert.match(await page.locator('.document-model-meta').innerText(),new RegExp(saved.model.sha256.slice(0,12)));
-  await page.screenshot({path:path.join(temporary,'interconnection-refreshed.png')});
+  await page.screenshot({path:path.join(temporary,'combined-view-refreshed.png')});
   await fs.writeFile(path.join(temporary,'refreshed-model.json'),JSON.stringify(refreshed,null,2));
   steps.push('hash-guarded node and connection edit, save, fresh backend query and updated undirected diagram');
+  await page.setViewportSize({width:650,height:900});
+  await page.locator('[data-document-filter]').selectOption('all');await page.locator('[data-document-filter]').selectOption('structure');
+  await page.waitForFunction(() => document.querySelector('.semantic-label').getScreenCTM().a >= 1);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),true);
+  const readablePort = await page.locator('.semantic-endpoint .semantic-label').first().evaluate(element => parseFloat(getComputedStyle(element).fontSize)*element.getScreenCTM().a);
+  assert.ok(readablePort >= 11);
+  await page.locator('.semantic-edge-connect').first().press('Enter');
+  assert.equal(await page.locator('.source-line.is-highlighted').count(),1);
+  await page.locator('button[data-document-tab="diagram"]').click();
+  assert.equal(await page.locator('.semantic-edge-connect').count(),3);
+  steps.push('narrow combined view preserves readable scale, keyboard edge selection and source fallback');
+  await page.setViewportSize({width:1440,height:1000});
   await page.evaluate(markdown => {viewer.update({file:{path:'reports/run.md',content:markdown,mime:'text/markdown'},model:null,verification:null,tab:'preview'});},markdown);
   assert.equal(await page.locator('.document-markdown table').count(),1);assert.equal(await page.locator('.document-markdown ul ul').count(),1);assert.equal(await page.locator('.document-markdown img,.document-markdown script,.document-markdown iframe,.document-markdown svg').count(),0);assert.equal(await page.evaluate(() => window.pwned),undefined);
   await page.locator('[data-document-path="models/mission.sysml"]').click();assert.deepEqual(await page.evaluate(() => opened.at(-1)),{path:'models/mission.sysml',line:16});

@@ -224,7 +224,24 @@ function rawGraph(model) {
 }
 
 export function normalizeSemanticGraph(model, {path = '', view = 'structure'} = {}) {
-  const base = rawGraph(model), raw = view === 'interconnection' && base?.view !== 'interconnection' ? base?.interconnection : base;
+  const base = rawGraph(model);
+  let raw = view === 'interconnection' && base?.view !== 'interconnection' ? base?.interconnection : base;
+  if (view === 'combined' && base) {
+    const interconnection = base.interconnection;
+    const nodes = new Map(base.nodes.filter(node => node?.id).map(node => [node.id,node]));
+    const edges = new Map(base.edges.filter(Boolean).map(edge => [edge.id || JSON.stringify([edge.kind,edge.source,edge.target]),edge]));
+    for (const edge of base.edges) if (edge?.kind === 'composition' && nodes.has(edge.source) && nodes.has(edge.target) && edge.source !== edge.target) {
+      nodes.set(edge.target,{...nodes.get(edge.target),parent:edge.source});
+    }
+    if (Array.isArray(interconnection?.nodes) && Array.isArray(interconnection?.edges)) {
+      for (const node of interconnection.nodes) if (node?.id) {
+        const original = nodes.get(node.id);
+        nodes.set(node.id,{...original,...node,rows:original?.rows || node.rows});
+      }
+      for (const edge of interconnection.edges) if (edge) edges.set(edge.id || JSON.stringify([edge.kind,edge.source,edge.target]),{...edge,interconnection:true});
+    }
+    raw = {nodes:[...nodes.values()],edges:[...edges.values()],view:'combined'};
+  }
   if (!Array.isArray(raw?.nodes) || !Array.isArray(raw?.edges)) return {nodes:[], rows:[], edges:[], truncated:false};
   const nodes = [], rows = [], ids = new Set();
   for (const item of raw.nodes.slice(0, MAX_GRAPH)) {
@@ -239,7 +256,7 @@ export function normalizeSemanticGraph(model, {path = '', view = 'structure'} = 
     nodes.push(node);
   }
   const edges = raw.edges.slice(0, MAX_GRAPH * 4).filter(edge => edge && ids.has(edge.source) && ids.has(edge.target)).map(edge => ({
-    id:typeof edge.id === 'string' ? edge.id : null,source:edge.source,target:edge.target,kind:label(edge.kind || 'relationship'),composite:edge.composite,directed:edge.directed,
+    id:typeof edge.id === 'string' ? edge.id : null,source:edge.source,target:edge.target,kind:label(edge.kind || 'relationship'),composite:edge.composite,directed:edge.directed,interconnection:raw.view === 'interconnection' || edge.interconnection === true,
     label:label(edge.label),qname:label(edge.qname),metaclass:label(edge.metaclass),file:edge.file || path,
     line:Number.isInteger(edge.line) && edge.line > 0 ? edge.line : null,col:Number.isInteger(edge.col) && edge.col > 0 ? edge.col : null
   }));
@@ -252,10 +269,24 @@ const classes = node => node.kind === 'package' ? 'package' : /Requirement/i.tes
 
 function visibleGraph(graph, filter) {
   const byId = new Map(graph.nodes.map(node => [node.id,node]));
-  let nodes = graph.nodes.filter(node => node.kind !== 'package' && node.kind !== 'note' && (filter === 'interconnection' ? node.nodeKind !== 'def' && byId.get(node.parent)?.nodeKind !== 'def' : filter === 'all' || (filter === 'requirements' ? requirement(node) : structural(node))));
+  let nodes = graph.nodes.filter(node => node.kind !== 'package' && node.kind !== 'note' && (filter === 'all' || (filter === 'requirements' ? requirement(node) : structural(node))));
+  if (filter === 'structure') {
+    const usage = nodes.filter(node => {
+      let current = node;
+      const visited = new Set();
+      while (current && !visited.has(current.id)) {
+        if (current.nodeKind === 'def') return false;
+        visited.add(current.id);current = byId.get(current.parent);
+      }
+      return true;
+    });
+    if (usage.length) nodes = usage;
+    const connections = new Set(graph.edges.filter(edge => edge.interconnection || ['connect','flow'].includes(edge.kind)).map(edge => edge.id).filter(Boolean));
+    nodes = nodes.filter(node => !connections.has(node.id));
+  }
   if (!nodes.length && filter === 'structure') nodes = graph.nodes.filter(node => node.kind !== 'note' && node.kind !== 'package');
   const ids = new Set(nodes.map(node => node.id));
-  return {nodes,edges:graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target))};
+  return {nodes,edges:graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target) && (filter !== 'structure' || edge.interconnection || ['connect','flow'].includes(edge.kind)))};
 }
 
 // Layer layout uses only semantic edges. Ownership in the outline is separate;
@@ -278,33 +309,103 @@ export function layoutSemanticGraph(nodes, edges, {columnWidth = 304} = {}) {
     let top = 34;
     for (const node of layer) {
       const height = node.height || 82;
-      positioned.push({...node,x:40 + level * columnWidth,y:top,width:258,height});
+      positioned.push({...node,x:40 + level * columnWidth,y:top,width:node.width || 258,height});
       top += height + 30;
     }
   }
   return {nodes:positioned,width:Math.max(560,...positioned.map(node => node.x + node.width + 40)),height:Math.max(360,...positioned.map(node => node.y + node.height + 34))};
 }
 
-function layoutInterconnectionGraph(nodes, edges) {
-  const byId = new Map(nodes.map(node => [node.id,node])), ports = new Map();
-  for (const node of nodes) if (node.kind === 'port' && byId.has(node.parent) && byId.get(node.parent).kind !== 'port') {
-    if (!ports.has(node.parent)) ports.set(node.parent,[]);
-    ports.get(node.parent).push(node);
+export function layoutCombinedSemanticGraph(nodes, edges) {
+  const byId = new Map(nodes.map(node => [node.id,node])), ownerByPort = new Map(), ports = new Map();
+  for (const node of nodes) if (node.kind === 'port') {
+    let owner = byId.get(node.parent);
+    const visited = new Set([node.id]);
+    while (owner?.kind === 'port' && !visited.has(owner.id)) {visited.add(owner.id);owner = byId.get(owner.parent);}
+    if (owner && !visited.has(owner.id)) {
+      ownerByPort.set(node.id,owner.id);
+      if (!ports.has(owner.id)) ports.set(owner.id,[]);
+      ports.get(owner.id).push(node);
+    }
   }
-  const grouped = new Set([...ports.values()].flat().map(node => node.id));
-  const owners = nodes.filter(node => !grouped.has(node.id)).map(node => ({...node,height:Math.max(82,84 + (ports.get(node.id)?.length || 0) * 32)}));
-  const order = new Map(owners.map((node,index) => [node.id,index]));
-  const layoutEdges = edges.map(edge => {
-    let source = grouped.has(edge.source) ? byId.get(edge.source).parent : edge.source;
-    let target = grouped.has(edge.target) ? byId.get(edge.target).parent : edge.target;
-    if (edge.kind === 'connect' && order.get(source) > order.get(target)) [source,target] = [target,source];
-    return {...edge,source,target};
-  });
-  const layout = layoutSemanticGraph(owners,layoutEdges,{columnWidth:440}), endpoints = [];
-  for (const owner of layout.nodes) for (const [index,port] of (ports.get(owner.id) || []).entries()) {
-    endpoints.push({...port,x:owner.x + 14,y:owner.y + 78 + index * 32,width:230,height:24,endpoint:true});
+  const cards = nodes.filter(node => !ownerByPort.has(node.id)), cardIds = new Set(cards.map(node => node.id));
+  const parents = new Map(cards.map(node => [node.id,cardIds.has(node.parent) && node.parent !== node.id ? node.parent : null]));
+  for (const node of cards) {
+    let current = parents.get(node.id);
+    const visited = new Set([node.id]);
+    while (current && !visited.has(current)) {visited.add(current);current = parents.get(current);}
+    if (current) parents.set(node.id,null);
   }
-  return {...layout,nodes:[...layout.nodes,...endpoints]};
+  const children = new Map([[null,[]]]), depth = new Map(), measured = new Map(), contents = new Map();
+  for (const node of cards) {
+    const parent = parents.get(node.id);
+    if (!children.has(parent)) children.set(parent,[]);
+    children.get(parent).push(node);
+    let level = 0, current = parent;
+    while (current) {level++;current = parents.get(current);}
+    depth.set(node.id,level);
+  }
+  const paths = new Map(), linksByParent = new Map();
+  const ancestry = id => {
+    const owner = ownerByPort.get(id) || id;
+    if (!paths.has(owner)) {
+      const path = [];
+      let current = owner;
+      while (cardIds.has(current)) {path.push(current);current = parents.get(current);}
+      paths.set(owner,path.reverse());
+    }
+    return paths.get(owner);
+  };
+  for (const edge of edges) {
+    const sourcePath = ancestry(edge.source), targetPath = ancestry(edge.target);
+    let index = 0;
+    while (index < sourcePath.length && index < targetPath.length && sourcePath[index] === targetPath[index]) index++;
+    if (index === sourcePath.length || index === targetPath.length) continue;
+    const parent = index ? sourcePath[index - 1] : null;
+    if (!linksByParent.has(parent)) linksByParent.set(parent,[]);
+    linksByParent.get(parent).push({...edge,source:sourcePath[index],target:targetPath[index]});
+  }
+  const arrange = parent => {
+    const items = children.get(parent) || [], order = new Map(items.map((node,index) => [node.id,index]));
+    const links = (linksByParent.get(parent) || []).map(edge => {
+      let {source,target} = edge;
+      if (edge.kind !== 'flow' && order.get(source) > order.get(target)) [source,target] = [target,source];
+      return {...edge,source,target};
+    });
+    const positioned = layoutSemanticGraph(items.map(node => measured.get(node.id)),links,{columnWidth:1}).nodes;
+    const columns = [...new Set(positioned.map(node => node.x))].sort((first,second) => first - second), offsets = new Map();
+    let offset = 40;
+    for (const column of columns) {
+      offsets.set(column,offset);
+      offset += Math.max(...positioned.filter(node => node.x === column).map(node => node.width)) + 180;
+    }
+    return positioned.map(node => ({...node,x:offsets.get(node.x)}));
+  };
+  for (const node of [...cards].sort((first,second) => depth.get(second.id) - depth.get(first.id))) {
+    const nested = arrange(node.id), portCount = ports.get(node.id)?.length || 0, header = 72 + portCount * 30;
+    const width = Math.max(300,...nested.map(child => child.x + child.width + 40));
+    const height = nested.length ? Math.max(...nested.map(child => header + child.y + child.height)) + 34 : Math.max(104,header + 22);
+    measured.set(node.id,{...node,width,height,container:nested.length > 0,depth:depth.get(node.id)});
+    contents.set(node.id,nested.map(child => ({...child,y:child.y + header})));
+  }
+  const positioned = arrange(null), positionedById = new Map();
+  for (let index = 0; index < positioned.length; index++) {
+    const node = positioned[index];positionedById.set(node.id,node);
+    for (const child of contents.get(node.id) || []) positioned.push({...child,x:node.x + child.x,y:node.y + child.y});
+  }
+  const endpoints = [];
+  for (const owner of positioned) for (const [index,port] of (ports.get(owner.id) || []).entries()) {
+    let preference = 0;
+    for (const edge of edges) if (edge.source === port.id || edge.target === port.id) {
+      const otherId = edge.source === port.id ? edge.target : edge.source;
+      const other = positionedById.get(ownerByPort.get(otherId) || otherId);
+      if (other) preference += Math.sign(other.x + other.width / 2 - owner.x - owner.width / 2);
+    }
+    const side = preference < 0 ? 'left' : 'right';
+    endpoints.push({...port,x:owner.x + (side === 'right' ? owner.width : 0) - 6,y:owner.y + 76 + index * 30,width:12,height:12,endpoint:true,side,owner:owner.id});
+  }
+  const all = [...positioned,...endpoints];
+  return {nodes:all,width:Math.max(560,...all.map(node => node.x + node.width + 40)),height:Math.max(360,...all.map(node => node.y + node.height + 34))};
 }
 
 function relationshipStyle(edge) {
@@ -337,18 +438,21 @@ function wrapLabel(value, width = 28) {
 }
 
 function renderDiagram(graph, filter) {
-  const visible = visibleGraph(graph, filter), layout = filter === 'interconnection' ? layoutInterconnectionGraph(visible.nodes,visible.edges) : layoutSemanticGraph(visible.nodes,visible.edges), position = new Map(layout.nodes.map(node => [node.id,node]));
+  const combined = filter === 'structure', visible = visibleGraph(graph, filter), layout = combined ? layoutCombinedSemanticGraph(visible.nodes,visible.edges) : layoutSemanticGraph(visible.nodes,visible.edges), position = new Map(layout.nodes.map(node => [node.id,node]));
   if (!visible.nodes.length) return '<div class="document-empty">当前视图没有可展示的语义元素。可以查看大纲或源码。</div>';
   const edges = visible.edges.map(edge => {
     const source = position.get(edge.source), target = position.get(edge.target), forward = target.x >= source.x;
-    const x1 = source.x + (forward ? source.width : 0), y1 = source.y + source.height / 2, x2 = target.x + (forward ? 0 : target.width), y2 = target.y + target.height / 2;
-    const bend = Math.max(45,Math.abs(x2 - x1) * .5) * (forward ? 1 : -1), style = relationshipStyle(edge);
-    const curve = `M ${x1} ${y1} C ${x1 + bend} ${y1},${x2 - bend} ${y2},${x2} ${y2}`;
+    const x1 = source.x + (source.endpoint ? source.width / 2 : forward ? source.width : 0), y1 = source.y + source.height / 2, x2 = target.x + (target.endpoint ? target.width / 2 : forward ? 0 : target.width), y2 = target.y + target.height / 2;
+    const bend = Math.max(45,Math.abs(x2 - x1) * .5), style = relationshipStyle(edge);
+    const sourceDirection = source.endpoint ? source.side === 'right' ? 1 : -1 : forward ? 1 : -1;
+    const targetDirection = target.endpoint ? target.side === 'left' ? -1 : 1 : forward ? -1 : 1;
+    const curve = `M ${x1} ${y1} C ${x1 + sourceDirection * bend} ${y1},${x2 + targetDirection * bend} ${y2},${x2} ${y2}`;
     const selection = edge.id ? ` role="button" tabindex="0" aria-label="${attr(edge.label || edge.kind)}" data-document-edge="${attr(edge.id)}"` : '';
     return `<g class="semantic-edge semantic-edge-${attr(edge.kind.replace(/[^a-z-]/gi,''))}"${selection} data-edge-source="${attr(edge.source)}" data-edge-target="${attr(edge.target)}">${edge.id ? `<path class="semantic-edge-hit" d="${curve}"></path>` : ''}<path d="${curve}"${style.marker}></path><text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 6}">${esc(edge.label || edge.kind)}</text><title>${esc(source.label)} ${style.symbol} ${esc(target.label)} · ${esc(edge.label || edge.kind)}${edge.line ? ' · L' + edge.line : ''}</title></g>`;
   }).join('');
-  const cards = layout.nodes.map(node => `<g role="button" tabindex="0" aria-label="${attr((node.endpoint ? position.get(node.parent).label + ' · ' : '') + node.stereo + ' ' + node.label)}" class="semantic-node semantic-${classes(node)}${node.endpoint ? ' semantic-endpoint' : ''}" data-document-element="${attr(node.id)}" transform="translate(${node.x} ${node.y})"><title>${esc(node.qname)}${node.line ? ' · L' + node.line : ''}</title><rect width="${node.width}" height="${node.height}" rx="${node.endpoint ? 4 : 8}"></rect>${node.endpoint ? `<text class="semantic-label" x="8" y="16">${esc(wrapLabel(node.label)[0])}</text>` : `<text class="semantic-stereo" x="14" y="20">«${esc(node.stereo)}»</text>${wrapLabel(node.label).map((part,i) => `<text class="semantic-label" x="14" y="${43 + i * 17}">${esc(part)}</text>`).join('')}`}</g>`).join('');
-  return `<div class="semantic-canvas" tabindex="0" aria-label="SysML 模型图，可拖动和缩放"><svg class="semantic-svg" role="img" aria-label="SysML ${filter === 'interconnection' ? '子系统互连' : '语义结构'}" viewBox="0 0 ${layout.width} ${layout.height}" data-diagram-width="${layout.width}" data-diagram-height="${layout.height}"><defs><marker id="document-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="currentColor"></path></marker><marker id="document-typing" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="white" stroke="currentColor"></path></marker><marker id="document-composition" markerWidth="12" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M1 4 L6 1 L11 4 L6 7 Z" fill="currentColor"></path></marker></defs>${filter === 'interconnection' ? cards + edges : edges + cards}</svg></div><div class="semantic-legend">${filter === 'interconnection' ? '<span>实线 connect，无方向</span><span>箭头 flow，按模型方向</span>' : '<span>菱形 composition · 实线 membership</span><span>虚线空心三角 typing</span>'}<span>${visible.nodes.length} 个元素 · ${visible.edges.length} 条语义关系</span></div>`;
+  const card = node => `<g role="button" tabindex="0" aria-label="${attr((node.endpoint ? position.get(node.owner).label + ' · ' : '') + node.stereo + ' ' + node.label)}" class="semantic-node semantic-${classes(node)}${node.container ? ' semantic-container' : ''}${node.endpoint ? ' semantic-endpoint' : ''}"${node.parent ? ` data-document-parent="${attr(node.parent)}"` : ''} data-document-element="${attr(node.id)}" transform="translate(${node.x} ${node.y})"><title>${esc(node.qname)}${node.line ? ' · L' + node.line : ''}</title><rect width="${node.width}" height="${node.height}" rx="${node.endpoint ? 2 : 8}"></rect>${node.endpoint ? `<text class="semantic-label semantic-port-label" x="${node.side === 'left' ? 16 : -4}" y="10" text-anchor="${node.side === 'left' ? 'start' : 'end'}">${esc(wrapLabel(node.label)[0])}</text>` : `<text class="semantic-stereo" x="14" y="20">«${esc(node.stereo)}»</text>${wrapLabel(node.label).map((part,index) => `<text class="semantic-label" x="14" y="${43 + index * 17}">${esc(part)}</text>`).join('')}${node.container ? `<line x1="1" y1="68" x2="${node.width - 1}" y2="68"></line>` : ''}`}</g>`;
+  const cards = layout.nodes.filter(node => !node.endpoint).map(card).join(''), endpoints = layout.nodes.filter(node => node.endpoint).map(card).join('');
+  return `<div class="semantic-canvas" tabindex="0" aria-label="SysML 模型图，可拖动和缩放"><svg class="semantic-svg" role="img" aria-label="SysML ${combined ? '结构与互连' : '语义关系'}" viewBox="0 0 ${layout.width} ${layout.height}" data-diagram-width="${layout.width}" data-diagram-height="${layout.height}"><defs><marker id="document-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="currentColor"></path></marker><marker id="document-typing" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="white" stroke="currentColor"></path></marker><marker id="document-composition" markerWidth="12" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M1 4 L6 1 L11 4 L6 7 Z" fill="currentColor"></path></marker></defs>${combined ? cards + edges + endpoints : edges + cards}</svg></div><div class="semantic-legend">${combined ? '<span>嵌套框 组成 · 名称 : 类型</span><span>实线 connect，无方向 · 箭头 flow</span>' : '<span>菱形 composition · 实线 membership</span><span>虚线空心三角 typing</span>'}<span>${visible.nodes.length} 个元素 · ${visible.edges.length} 条${combined ? '互连' : '语义关系'}</span></div>`;
 }
 
 function renderOutline(graph, query = '') {
@@ -413,7 +517,8 @@ function edgeDetails(edge, graph, file) {
 }
 
 export function renderDocumentViewer({file = {},model,verification,tab,filter = 'structure',resolveImage,dataState = {},parsedData} = {}) {
-  const kind = documentKind(file), isData = ['json','jsonl','csv'].includes(kind), parsed = parsedData || (isData ? parseDataDocument(file) : null), isMap = kind === 'json' && isGeoJSON(parsed?.root), isModel = kind === 'sysml', graph = normalizeSemanticGraph(model,{path:file.path,view:filter === 'interconnection' ? 'interconnection' : 'structure'}), selectedTab = tab || (isModel ? 'diagram' : isMap ? 'map' : 'preview');
+  if (filter === 'interconnection') filter = 'structure';
+  const kind = documentKind(file), isData = ['json','jsonl','csv'].includes(kind), parsed = parsedData || (isData ? parseDataDocument(file) : null), isMap = kind === 'json' && isGeoJSON(parsed?.root), isModel = kind === 'sysml', graph = normalizeSemanticGraph(model,{path:file.path,view:filter === 'structure' ? 'combined' : 'structure'}), selectedTab = tab || (isModel ? 'diagram' : isMap ? 'map' : 'preview');
   const tabs = isModel ? [['diagram','模型图'],['outline','大纲'],['source','源码'],['diagnostics','诊断'],['constraints','约束']] : kind === 'markdown' ? [['preview','阅读'],['source','源码']] : isMap ? [['map','地图'],['preview','数据'],['source','原始数据']] : isData ? [['preview','数据'],['source','原始数据']] : [['preview','内容']];
   const effectiveTab = tabs.some(([key]) => key === selectedTab) ? selectedTab : tabs[0][0];
   let body;
@@ -422,7 +527,7 @@ export function renderDocumentViewer({file = {},model,verification,tab,filter = 
     body = imageURL ? `<div class="document-raster-view"><img src="${attr(imageURL)}" alt="${attr(file.name || basename(file.path) || '工程图片')}" class="document-raster-image"><span>${esc(file.name || basename(file.path))}</span></div>` : '<div class="document-empty">暂时无法预览此图片。请检查文件是否存在或选择受支持的图片格式。</div>';
   }
   else if (kind === 'unsupported') body = '<div class="document-empty">此文件格式暂不支持应用内预览。请在文件列表中选择文档、SysML 模型或图片。</div>';
-  else if (isModel && effectiveTab === 'diagram') body = graph.nodes.length ? renderDiagram(graph,filter) : `<div class="document-empty">${model?.valid === false ? '模型存在诊断，暂时无法生成语义图。请查看诊断或源码。' : filter === 'interconnection' ? '尚未取得互连视图。请刷新模型，或切换到系统结构。' : '尚未加载 SysML 语义模型。请稍后重试或查看源码。'}</div>`;
+  else if (isModel && effectiveTab === 'diagram') body = graph.nodes.length ? renderDiagram(graph,filter) : `<div class="document-empty">${model?.valid === false ? '模型存在诊断，暂时无法生成语义图。请查看诊断或源码。' : '尚未加载 SysML 语义模型。请稍后重试或查看源码。'}</div>`;
   else if (isModel && effectiveTab === 'outline') body = renderOutline(graph);
   else if (isModel && effectiveTab === 'diagnostics') body = renderDiagnostics(model);
   else if (isModel && effectiveTab === 'constraints') body = renderConstraints(normalizeSemanticGraph(model,{path:file.path}),verification,model);
@@ -430,13 +535,13 @@ export function renderDocumentViewer({file = {},model,verification,tab,filter = 
   else if (isData && effectiveTab !== 'source') body = renderDataPreview(file,dataState,parsed);
   else if (effectiveTab === 'source' || kind !== 'markdown') body = renderSource(file.content || '',kind);
   else body = `<article class="document-markdown">${renderMarkdown(file.content || '',{path:file.path,resolveImage})}</article>`;
-  return `<section class="document-viewer" data-document-kind="${kind}" data-document-tab="${effectiveTab}"><header class="document-toolbar"><nav class="document-tabs" aria-label="文件视图">${tabs.map(([key,name]) => `<button type="button" data-document-tab="${key}" class="${effectiveTab === key ? 'active' : ''}" aria-pressed="${effectiveTab === key}">${name}${key === 'diagnostics' && model?.findings?.length ? ` <span>${model.findings.length}</span>` : ''}</button>`).join('')}</nav>${isModel && effectiveTab === 'diagram' ? `<div class="document-diagram-tools"><select aria-label="模型元素筛选" data-document-filter><option value="structure"${filter === 'structure' ? ' selected' : ''}>系统结构</option><option value="interconnection"${filter === 'interconnection' ? ' selected' : ''}>子系统互连</option><option value="requirements"${filter === 'requirements' ? ' selected' : ''}>需求与约束</option><option value="all"${filter === 'all' ? ' selected' : ''}>全部元素</option></select><button type="button" data-document-zoom="out" title="缩小" aria-label="缩小">−</button><button type="button" data-document-zoom="in" title="放大" aria-label="放大">+</button><button type="button" data-document-fit>适合窗口</button></div>` : isModel && effectiveTab === 'outline' ? '<input type="search" class="document-outline-search" data-document-search placeholder="查找模型元素" aria-label="查找模型元素">' : ''}</header><div class="document-viewer-body${isModel && effectiveTab === 'diagram' ? ' has-model-details' : ''}"><div class="document-main">${body}</div>${isModel && effectiveTab === 'diagram' ? `<aside class="semantic-details" aria-label="元素详情">${elementDetails(null,graph,file)}</aside>` : ''}</div>${isModel ? `<footer class="document-model-meta"><span>SysML v2${model?.backend?.version ? ' · ' + esc(model.backend.version) : ''}</span><span>${graph.nodes.length} 个语义元素${graph.truncated ? '（展示已截断）' : ''}</span>${model?.model?.sha256 || file.sha256 ? `<span title="${attr(model?.model?.sha256 || file.sha256)}">SHA ${esc((model?.model?.sha256 || file.sha256).slice(0,12))}</span>` : ''}</footer>` : isData && /^[a-f0-9]{64}$/i.test(file.sha256||'') ? `<footer class="document-model-meta"><span>项目文件 · ${esc(file.path||file.name||'')}</span><span title="${attr(file.sha256)}">SHA-256 ${esc(file.sha256.slice(0,12))}</span></footer>` : ''}</section>`;
+  return `<section class="document-viewer" data-document-kind="${kind}" data-document-tab="${effectiveTab}"><header class="document-toolbar"><nav class="document-tabs" aria-label="文件视图">${tabs.map(([key,name]) => `<button type="button" data-document-tab="${key}" class="${effectiveTab === key ? 'active' : ''}" aria-pressed="${effectiveTab === key}">${name}${key === 'diagnostics' && model?.findings?.length ? ` <span>${model.findings.length}</span>` : ''}</button>`).join('')}</nav>${isModel && effectiveTab === 'diagram' ? `<div class="document-diagram-tools"><select aria-label="模型视图" data-document-filter><option value="structure"${filter === 'structure' ? ' selected' : ''}>结构与互连</option><option value="requirements"${filter === 'requirements' ? ' selected' : ''}>需求与约束</option><option value="all"${filter === 'all' ? ' selected' : ''}>元素与类型关系</option></select><button type="button" data-document-zoom="out" title="缩小" aria-label="缩小">−</button><button type="button" data-document-zoom="in" title="放大" aria-label="放大">+</button><button type="button" data-document-fit>适合窗口</button></div>` : isModel && effectiveTab === 'outline' ? '<input type="search" class="document-outline-search" data-document-search placeholder="查找模型元素" aria-label="查找模型元素">' : ''}</header><div class="document-viewer-body${isModel && effectiveTab === 'diagram' ? ' has-model-details' : ''}"><div class="document-main">${body}</div>${isModel && effectiveTab === 'diagram' ? `<aside class="semantic-details" aria-label="元素详情">${elementDetails(null,graph,file)}</aside>` : ''}</div>${isModel ? `<footer class="document-model-meta"><span>SysML v2${model?.backend?.version ? ' · ' + esc(model.backend.version) : ''}</span><span>${graph.nodes.length} 个语义元素${graph.truncated ? '（展示已截断）' : ''}</span>${model?.model?.sha256 || file.sha256 ? `<span title="${attr(model?.model?.sha256 || file.sha256)}">SHA ${esc((model?.model?.sha256 || file.sha256).slice(0,12))}</span>` : ''}</footer>` : isData && /^[a-f0-9]{64}$/i.test(file.sha256||'') ? `<footer class="document-model-meta"><span>项目文件 · ${esc(file.path||file.name||'')}</span><span title="${attr(file.sha256)}">SHA-256 ${esc(file.sha256.slice(0,12))}</span></footer>` : ''}</section>`;
 }
 
 export function mountDocumentViewer(container, options = {}) {
   if (!container || typeof container.addEventListener !== 'function') throw new TypeError('Document viewer container required');
   let current = {...options,dataState:{...options.dataState}}, parsedFile = null, parsedData = null, destroyed = false, drag = null, viewBox, initialBox, cleanupCanvas, defaultViewport = true;
-  const getGraph = () => normalizeSemanticGraph(current.model,{path:current.file?.path,view:current.filter === 'interconnection' ? 'interconnection' : 'structure'});
+  const getGraph = () => normalizeSemanticGraph(current.model,{path:current.file?.path,view:!current.filter || ['structure','interconnection'].includes(current.filter) ? 'combined' : 'structure'});
   const draw = () => {
     cleanupCanvas?.();if(parsedFile!==current.file){parsedFile=current.file;parsedData=['json','jsonl','csv'].includes(documentKind(current.file))?parseDataDocument(current.file):null;}container.innerHTML = renderDocumentViewer({...current,parsedData});setupCanvas();
   };
@@ -475,7 +580,7 @@ export function mountDocumentViewer(container, options = {}) {
     const graph = getGraph(), node = [...graph.nodes,...graph.rows].find(item => item.id === id);if(!node)return;
     container.querySelectorAll('[data-document-element]').forEach(element => {const selected = element.dataset.documentElement === id;element.classList.toggle('is-selected',selected);element.setAttribute('aria-selected',String(selected));});
     container.querySelectorAll('.semantic-edge').forEach(edge => {edge.classList.remove('is-selected');edge.classList.toggle('is-connected',edge.dataset.edgeSource === id || edge.dataset.edgeTarget === id);edge.setAttribute('aria-selected','false');});
-    const details = container.querySelector('.semantic-details');if(details)details.innerHTML = elementDetails(node,graph,current.file || {});
+    const details = container.querySelector('.semantic-details');if(details?.getClientRects().length)details.innerHTML = elementDetails(node,graph,current.file || {});
     else if(node.line)sourceLine(node.line);
     current.onSelectElement?.(node);
   };
@@ -483,7 +588,7 @@ export function mountDocumentViewer(container, options = {}) {
     const graph = getGraph(), edge = graph.edges.find(item => item.id === id);if(!edge)return;
     container.querySelectorAll('[data-document-element]').forEach(element => {element.classList.remove('is-selected');element.setAttribute('aria-selected','false');});
     container.querySelectorAll('.semantic-edge').forEach(element => {const selected = element.dataset.documentEdge === id;element.classList.toggle('is-selected',selected);element.classList.toggle('is-connected',selected);element.setAttribute('aria-selected',String(selected));});
-    const details = container.querySelector('.semantic-details');if(details)details.innerHTML = edgeDetails(edge,graph,current.file || {});
+    const details = container.querySelector('.semantic-details');if(details?.getClientRects().length)details.innerHTML = edgeDetails(edge,graph,current.file || {});
     else if(edge.line)sourceLine(edge.line);
     current.onSelectEdge?.(edge);
   };

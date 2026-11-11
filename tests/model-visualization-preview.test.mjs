@@ -51,7 +51,8 @@ test('native preview serves real SysML graph data consumable by the existing SVG
     assert.ok(result.model.data.edges.length > 0);
     assert.equal(result.model.data.interconnection.view, 'interconnection');
     assert.equal(result.model.data.interconnection.edges.filter(edge => edge.kind === 'connect').length, sample === 'connected' ? 3 : 0);
-    const interconnection = renderDocumentViewer({file: result.file, model: result.model, filter: 'interconnection'});
+    const interconnection = renderDocumentViewer({file: result.file, model: result.model});
+    assert.match(interconnection,/<option value="structure" selected>结构与互连<\/option>/);
     assert.equal((interconnection.match(/class="semantic-edge semantic-edge-connect"/g) || []).length, sample === 'connected' ? 3 : 0);
     assert.match(renderDocumentViewer({file: result.file, model: result.model}), /class="semantic-svg"/);
     assert.equal(result.diagrams, undefined);

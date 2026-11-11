@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {renderMarkdown,resolveDocumentLink,documentKind,normalizeSemanticGraph,layoutSemanticGraph,renderDocumentViewer} from '../public/document-viewer.mjs';
+import {renderMarkdown,resolveDocumentLink,documentKind,normalizeSemanticGraph,layoutSemanticGraph,layoutCombinedSemanticGraph,renderDocumentViewer} from '../public/document-viewer.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const source = 'package ViewerExample { private import ScalarValues::*; attribute def Quaternion { attribute scalar : Real; } part def Sensor { port sample; } part sensor : Sensor; requirement def CorrectFrame; requirement contract : CorrectFrame; attribute residual : Real = 0.0024; assert constraint framePassed { residual < 0.02 } }';
@@ -54,8 +54,10 @@ test('model diagram maps the real SysML kernel graph, includes typed members and
   const layout = layoutSemanticGraph(graph.nodes,graph.edges);
   assert.equal(layout.nodes.length,graph.nodes.length);assert.ok(layout.nodes.every(node => Number.isFinite(node.x) && Number.isFinite(node.y)));
   const html = renderDocumentViewer({file:{path:'models/example.sysml',content:source},model:semantic});
-  assert.match(html,/class="semantic-svg"/);assert.match(html,/«part def»/);assert.match(html,/data-document-element=/);
-  assert.match(html,/typing/);assert.doesNotMatch(html,/Manta trace|JSON 追溯/);
+  assert.match(html,/class="semantic-svg"/);assert.match(html,/sensor : Sensor/);assert.match(html,/data-document-element=/);
+  assert.doesNotMatch(html,/Manta trace|JSON 追溯/);
+  const definitions = renderDocumentViewer({file:{path:'models/example.sysml',content:source},model:semantic,filter:'all'});
+  assert.match(definitions,/«part def»/);assert.match(definitions,/typing/);
 });
 
 test('kernel supplies structure and interconnection views with distinct usage-port endpoints',async () => {
@@ -85,8 +87,10 @@ test('kernel supplies structure and interconnection views with distinct usage-po
       assert.equal(edge.col,20);
       assert.equal(edge.qname,'VisualizationDemo::signalChain::' + edge.label);
     }
-    const html = renderDocumentViewer({file:{path:'models/example.sysml',content},model,filter:'interconnection'});
-    assert.match(html,/<option value="interconnection" selected>子系统互连<\/option>/);
+    const html = renderDocumentViewer({file:{path:'models/example.sysml',content},model});
+    assert.match(html,/<option value="structure" selected>结构与互连<\/option>/);
+    assert.doesNotMatch(html,/<option value="interconnection"/);
+    assert.match(html,/semantic-container/);
     assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,3);
     assert.match(html,/data-document-edge=/);
     assert.match(html,/data-document-element="[^"]+"[^>]*transform="translate[^"]+"[^>]*>[\s\S]*sensor : Sensor/);
@@ -107,7 +111,7 @@ test('edge normalization preserves connection identity and location while escapi
 
 test('relationship markers distinguish connection, flow, composition and typing without invented directions',() => {
   const nodes = [{id:'a',label:'A',metaclass:'PartUsage'},{id:'b',label:'B',metaclass:'PartUsage'}];
-  const render = edges => renderDocumentViewer({file:{path:'model.sysml'},model:{nodes,edges}});
+  const render = edges => renderDocumentViewer({file:{path:'model.sysml'},model:{nodes,edges},filter:'all'});
   for (const [kind,sourceId,targetId] of [['connect','a','b'],['connect','b','a'],['membership','a','b'],['unknown','a','b']]) {
     const html = render([{source:sourceId,target:targetId,kind}]);
     assert.doesNotMatch(html,/marker-end=|marker-start=/);
@@ -123,7 +127,7 @@ test('reversing connect spelling preserves undirected rendering and owner-port p
   const reversed = content.replace('sensor.output to uart.input','uart.input to sensor.output');
   const models = [kernel('query',content),kernel('query',reversed)];
   const placements = models.map(model => {
-    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model,filter:'interconnection'});
+    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model});
     assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,3);
     assert.doesNotMatch(html,/marker-end=|marker-start=/);
     return [...html.matchAll(/data-document-element="([^"]+)" transform="([^"]+)"/g)].map(match => match.slice(1));
@@ -144,10 +148,57 @@ test('real flow direction and source metadata survive normalization and renderin
     assert.equal(flow.line,27);
     assert.match(byId.get(byId.get(flow.source).parent).label,new RegExp('^' + start.split('.')[0] + ' :'));
     assert.match(byId.get(byId.get(flow.target).parent).label,new RegExp('^' + end.split('.')[0] + ' :'));
-    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model,filter:'interconnection'});
+    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model});
     assert.equal((html.match(/marker-end="url\(#document-arrow\)"/g) || []).length,1);
     assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,2);
   }
+});
+
+test('combined normalization merges kernel identities without losing tree members or connection metadata',async () => {
+  const content = await fs.readFile(path.join(root,'docs/assets/model-visualization/connected-demo.sysml'),'utf8');
+  const model = kernel('query',content), tree = normalizeSemanticGraph(model), graph = normalizeSemanticGraph(model,{view:'combined'});
+  assert.equal(new Set(graph.nodes.map(node => node.id)).size,graph.nodes.length);
+  assert.equal(graph.edges.filter(edge => edge.kind === 'connect').length,3);
+  for (const node of tree.nodes) assert.deepEqual(graph.nodes.find(item => item.id === node.id).rows,node.rows);
+  for (const node of model.data.interconnection.nodes) if (node.parent) assert.equal(graph.nodes.find(item => item.id === node.id).parent,node.parent);
+  const html = renderDocumentViewer({file:{path:'models/example.sysml'},model});
+  const connection = tree.nodes.find(node => node.label === 'sensorToUart');
+  assert.doesNotMatch(html,new RegExp('data-document-element="' + connection.id + '"'));
+  assert.match(html,new RegExp('data-document-edge="' + connection.id + '"'));
+});
+
+test('combined layout nests multi-level parts and places distinct port IDs on owner boundaries',() => {
+  const nodes = [
+    {id:'system',label:'system',kind:'block',parent:null},
+    {id:'subsystem',label:'subsystem',kind:'block',parent:'system'},
+    {id:'sender',label:'sender : Relay',kind:'block',parent:'subsystem'},
+    {id:'receiver',label:'receiver : Relay',kind:'block',parent:'system'},
+    {id:'out',label:'output',kind:'port',parent:'sender'},
+    {id:'in',label:'input',kind:'port',parent:'receiver'}
+  ];
+  const edges = [{id:'wire',source:'out',target:'in',kind:'connect'}];
+  const layout = layoutCombinedSemanticGraph(nodes,edges), byId = new Map(layout.nodes.map(node => [node.id,node]));
+  assert.equal(layout.nodes.length,nodes.length);
+  for (const id of ['subsystem','sender','receiver']) {
+    const node = byId.get(id), parent = byId.get(node.parent);
+    assert.ok(node.x > parent.x && node.y > parent.y);
+    assert.ok(node.x + node.width < parent.x + parent.width);
+    assert.ok(node.y + node.height < parent.y + parent.height);
+  }
+  for (const id of ['out','in']) {
+    const port = byId.get(id), parent = byId.get(port.parent), center = port.x + port.width / 2;
+    assert.ok(center === parent.x || center === parent.x + parent.width);
+    assert.ok(port.y > parent.y && port.y + port.height < parent.y + parent.height);
+  }
+  const reversed = layoutCombinedSemanticGraph(nodes,[{...edges[0],source:'in',target:'out'}]);
+  assert.deepEqual(reversed.nodes,layout.nodes);
+});
+
+test('combined view remains useful for definitions-only models and never fabricates connections',() => {
+  const model = kernel('query','package DefinitionsOnly { port def Signal; part def Device { port input : Signal; } }');
+  const html = renderDocumentViewer({file:{path:'models/definitions.sysml'},model});
+  assert.match(html,/«part def»/);assert.match(html,/Device/);assert.match(html,/input : Signal/);
+  assert.doesNotMatch(html,/class="semantic-edge semantic-edge-connect"/);
 });
 
 test('constraints display kernel evaluation results and do not invent satisfaction',() => {
