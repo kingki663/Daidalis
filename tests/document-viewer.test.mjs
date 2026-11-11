@@ -8,8 +8,8 @@ import {renderMarkdown,resolveDocumentLink,documentKind,normalizeSemanticGraph,l
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const source = 'package ViewerExample { private import ScalarValues::*; attribute def Quaternion { attribute scalar : Real; } part def Sensor { port sample; } part sensor : Sensor; requirement def CorrectFrame; requirement contract : CorrectFrame; attribute residual : Real = 0.0024; assert constraint framePassed { residual < 0.02 } }';
-function kernel(operation) {
-  const result = spawnSync(process.execPath,[path.join(root,'server/model-backend/worker.mjs'),path.join(root,'toolchains/sysml/package')],{input:JSON.stringify({operation,sources:[{name:'models/example.sysml',text:source}]}),encoding:'utf8',maxBuffer:12_000_000});
+function kernel(operation, content = source) {
+  const result = spawnSync(process.execPath,[path.join(root,'server/model-backend/worker.mjs'),path.join(root,'toolchains/sysml/package')],{input:JSON.stringify({operation,sources:[{name:'models/example.sysml',text:content}]}),encoding:'utf8',maxBuffer:12_000_000});
   assert.equal(result.status,0,result.stderr);
   return JSON.parse(result.stdout);
 }
@@ -56,6 +56,98 @@ test('model diagram maps the real SysML kernel graph, includes typed members and
   const html = renderDocumentViewer({file:{path:'models/example.sysml',content:source},model:semantic});
   assert.match(html,/class="semantic-svg"/);assert.match(html,/«part def»/);assert.match(html,/data-document-element=/);
   assert.match(html,/typing/);assert.doesNotMatch(html,/Manta trace|JSON 追溯/);
+});
+
+test('kernel supplies structure and interconnection views with distinct usage-port endpoints',async () => {
+  const content = await fs.readFile(path.join(root,'docs/assets/model-visualization/connected-demo.sysml'),'utf8');
+  for (const operation of ['query','validate']) {
+    const model = kernel(operation,content), structure = normalizeSemanticGraph(model), graph = normalizeSemanticGraph(model,{view:'interconnection'});
+    assert.equal(model.valid,true);
+    assert.ok(structure.nodes.some(node => node.metaclass === 'ConnectionUsage'));
+    assert.ok(structure.edges.some(edge => edge.kind === 'typing'));
+    const byId = new Map(graph.nodes.map(node => [node.id,node]));
+    const connections = graph.edges.filter(edge => edge.kind === 'connect');
+    assert.equal(connections.length,3);
+    assert.deepEqual(connections.map(edge => [
+      edge.label,byId.get(byId.get(edge.source).parent).label,byId.get(edge.source).label,
+      byId.get(byId.get(edge.target).parent).label,byId.get(edge.target).label
+    ]),[
+      ['sensorToUart','sensor : Sensor','output : SamplePort','uart : Relay','input : ~SamplePort'],
+      ['uartToSoftware','uart : Relay','output : SamplePort','flightSoftware : Relay','input : ~SamplePort'],
+      ['softwareToEstimator','flightSoftware : Relay','output : SamplePort','attitudeEstimator : Estimator','input : ~SamplePort']
+    ]);
+    assert.notEqual(connections[0].target,connections[1].target);
+    for (const [index,edge] of connections.entries()) {
+      assert.ok(edge.id);
+      assert.equal(edge.metaclass,'ConnectionUsage');
+      assert.equal(edge.file,'models/example.sysml');
+      assert.equal(edge.line,27 + index);
+      assert.equal(edge.col,20);
+      assert.equal(edge.qname,'VisualizationDemo::signalChain::' + edge.label);
+    }
+    const html = renderDocumentViewer({file:{path:'models/example.sysml',content},model,filter:'interconnection'});
+    assert.match(html,/<option value="interconnection" selected>子系统互连<\/option>/);
+    assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,3);
+    assert.match(html,/data-document-edge=/);
+    assert.match(html,/data-document-element="[^"]+"[^>]*transform="translate[^"]+"[^>]*>[\s\S]*sensor : Sensor/);
+    assert.doesNotMatch(html,/marker-end="url\(#document-arrow\)"/);
+  }
+});
+
+test('edge normalization preserves connection identity and location while escaping model text',() => {
+  const edge = {id:'wire" onclick="bad',source:'a',target:'b',kind:'connect',label:'<wire>',metaclass:'ConnectionUsage',qname:'Demo::<wire>',file:'models/wire.sysml',line:7,col:12};
+  const data = {nodes:[{id:'a',label:'A',metaclass:'PartUsage'},{id:'b',label:'B',metaclass:'PartUsage'}],edges:[edge]};
+  const graph = normalizeSemanticGraph({data});
+  for (const key of ['id','source','target','kind','label','metaclass','qname','file','line','col']) assert.equal(graph.edges[0][key],edge[key]);
+  const html = renderDocumentViewer({file:{path:'models/wire.sysml'},model:{data}});
+  assert.match(html,/wire&quot; onclick=&quot;bad/);
+  assert.match(html,/&lt;wire&gt;/);
+  assert.doesNotMatch(html,/<wire>|id="wire" onclick="bad/);
+});
+
+test('relationship markers distinguish connection, flow, composition and typing without invented directions',() => {
+  const nodes = [{id:'a',label:'A',metaclass:'PartUsage'},{id:'b',label:'B',metaclass:'PartUsage'}];
+  const render = edges => renderDocumentViewer({file:{path:'model.sysml'},model:{nodes,edges}});
+  for (const [kind,sourceId,targetId] of [['connect','a','b'],['connect','b','a'],['membership','a','b'],['unknown','a','b']]) {
+    const html = render([{source:sourceId,target:targetId,kind}]);
+    assert.doesNotMatch(html,/marker-end=|marker-start=/);
+    assert.doesNotMatch(html,/A — connect → B|B — connect → A/);
+  }
+  assert.match(render([{source:'a',target:'b',kind:'flow'}]),/marker-end="url\(#document-arrow\)"/);
+  assert.match(render([{source:'a',target:'b',kind:'composition'}]),/marker-start="url\(#document-composition\)"/);
+  assert.match(render([{source:'a',target:'b',kind:'typing'}]),/marker-end="url\(#document-typing\)"/);
+});
+
+test('reversing connect spelling preserves undirected rendering and owner-port placement',async () => {
+  const content = await fs.readFile(path.join(root,'docs/assets/model-visualization/connected-demo.sysml'),'utf8');
+  const reversed = content.replace('sensor.output to uart.input','uart.input to sensor.output');
+  const models = [kernel('query',content),kernel('query',reversed)];
+  const placements = models.map(model => {
+    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model,filter:'interconnection'});
+    assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,3);
+    assert.doesNotMatch(html,/marker-end=|marker-start=/);
+    return [...html.matchAll(/data-document-element="([^"]+)" transform="([^"]+)"/g)].map(match => match.slice(1));
+  });
+  assert.deepEqual(placements[0],placements[1]);
+});
+
+test('real flow direction and source metadata survive normalization and rendering',async () => {
+  const content = await fs.readFile(path.join(root,'docs/assets/model-visualization/connected-demo.sysml'),'utf8');
+  for (const [start,end] of [['sensor.output','uart.input'],['uart.input','sensor.output']]) {
+    const model = kernel('query',content.replace('connection sensorToUart connect sensor.output to uart.input;',`flow samples from ${start} to ${end};`));
+    assert.equal(model.valid,true);
+    const graph = normalizeSemanticGraph(model,{view:'interconnection'}), flow = graph.edges.find(edge => edge.kind === 'flow');
+    const byId = new Map(graph.nodes.map(node => [node.id,node]));
+    assert.equal(flow.directed,true);
+    assert.equal(flow.metaclass,'FlowUsage');
+    assert.equal(flow.label,'samples');
+    assert.equal(flow.line,27);
+    assert.match(byId.get(byId.get(flow.source).parent).label,new RegExp('^' + start.split('.')[0] + ' :'));
+    assert.match(byId.get(byId.get(flow.target).parent).label,new RegExp('^' + end.split('.')[0] + ' :'));
+    const html = renderDocumentViewer({file:{path:'models/example.sysml'},model,filter:'interconnection'});
+    assert.equal((html.match(/marker-end="url\(#document-arrow\)"/g) || []).length,1);
+    assert.equal((html.match(/class="semantic-edge semantic-edge-connect"/g) || []).length,2);
+  }
 });
 
 test('constraints display kernel evaluation results and do not invent satisfaction',() => {

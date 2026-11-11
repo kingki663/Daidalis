@@ -6,8 +6,11 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawnSync} from 'node:child_process';
 import {chromium} from 'playwright';
+import {createStore} from '../server/store.mjs';
+import {createModelBackendService} from '../server/model-backend.mjs';
 
-const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))), temporary = await fs.mkdtemp(path.join(os.tmpdir(),'manta-document-viewer-'));
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url))), temporary = process.env.MANTA_DOCUMENT_EVIDENCE || await fs.mkdtemp(path.join(os.tmpdir(),'manta-document-viewer-'));
+await fs.mkdir(temporary,{recursive:true});
 const source = await fs.readFile(path.join(root,'server/model-backend/nos3-integration.sysml'),'utf8');
 function kernel(operation) { const r = spawnSync(process.execPath,[path.join(root,'server/model-backend/worker.mjs'),path.join(root,'toolchains/sysml/package')],{input:JSON.stringify({operation,sources:[{name:'models/mission.sysml',text:source}]}),encoding:'utf8',maxBuffer:12_000_000});assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout); }
 const fixture = {file:{path:'models/mission.sysml',content:source},model:kernel('query'),verification:kernel('verify')};
@@ -38,6 +41,83 @@ try {
   await page.evaluate(() => viewer.update({sourceLine:28}));assert.equal(await page.locator('.source-line.is-highlighted').getAttribute('data-source-line'),'28');
   await page.locator('button[data-document-tab="diagnostics"]').click();assert.match(await page.locator('.document-diagnostics').innerText(),/校验通过/);
   await page.locator('button[data-document-tab="constraints"]').click();assert.match(await page.locator('.document-constraints').innerText(),/后端静态约束求值/);steps.push('backend diagnostics and real static verification results');
+  const store = createStore({dataDir:path.join(temporary,'project-data'),seed:false}), project = store.createProject({name:'Generated interconnection acceptance'});
+  const service = await createModelBackendService({store}), modelPath = 'models/generated-chain.sysml';
+  const generated = `package GeneratedChain {
+    port def Signal;
+    part def Device {
+        port input : Signal;
+        port output : Signal;
+    }
+    part system {
+        part sensor : Device;
+        part uart : Device;
+        part flightSoftware : Device;
+        part estimator : Device;
+        connection sensorToUart connect sensor.output to uart.input;
+        connection uartToSoftware connect uart.output to flightSoftware.input;
+        connection softwareToEstimator connect flightSoftware.output to estimator.input;
+    }
+}`;
+  const args = {projectId:project.id,path:modelPath}, imported = await service.importModel({...args,content:generated});
+  assert.equal(imported.imported,true);
+  async function readGenerated() {
+    const model = await service.query(args), content = await fs.readFile(path.join(store.workspace(project.id),modelPath),'utf8');
+    return {file:{path:modelPath,content,sha256:model.model.sha256},model,verification:null,tab:'diagram',filter:'structure'};
+  }
+  const generatedFixture = await readGenerated();
+  await fs.writeFile(path.join(temporary,'generated-model.json'),JSON.stringify(generatedFixture,null,2));
+  await page.evaluate(options => viewer.update(options),generatedFixture);
+  assert.ok(await page.locator('.semantic-edge-composition').count() > 0);
+  await page.locator('[data-document-filter]').selectOption('interconnection');
+  await page.locator('[data-document-fit]').click();
+  assert.equal(await page.locator('.semantic-edge-connect').count(),3);
+  assert.equal(await page.locator('.semantic-edge-connect [marker-end],.semantic-edge-connect [marker-start]').count(),0);
+  const endpoints = await page.locator('.semantic-endpoint').evaluateAll(elements => elements.map(element => ({id:element.dataset.documentElement,label:element.getAttribute('aria-label')})));
+  const uartInput = endpoints.find(node => node.label.startsWith('uart : Device') && node.label.endsWith('input : Signal'));
+  const softwareInput = endpoints.find(node => node.label.startsWith('flightSoftware : Device') && node.label.endsWith('input : Signal'));
+  assert.ok(uartInput);assert.ok(softwareInput);assert.notEqual(uartInput.id,softwareInput.id);
+  for (const [name,line] of [['sensorToUart',12],['uartToSoftware',13],['softwareToEstimator',14]]) {
+    const edge = page.locator('.semantic-edge-connect').filter({has:page.locator('text', {hasText:new RegExp('^' + name + '$')})});
+    await edge.locator('text').click();
+    assert.match(await page.locator('.semantic-details').innerText(),new RegExp(name + '[\\s\\S]*ConnectionUsage'));
+    assert.equal(await page.locator('.semantic-details [data-document-source-line]').getAttribute('data-document-source-line'),String(line));
+    if (name === 'uartToSoftware') await page.screenshot({path:path.join(temporary,'interconnection.png')});
+    await page.locator('.semantic-details [data-document-source-line]').click();
+    assert.equal(await page.locator('.source-line.is-highlighted').getAttribute('data-source-line'),String(line));
+    await page.locator('button[data-document-tab="diagram"]').click();await page.locator('[data-document-fit]').click();
+  }
+  await page.locator('.semantic-edge-connect').first().press('Enter');
+  assert.equal(await page.locator('.semantic-edge-connect.is-selected').count(),1);
+  await page.locator(`.semantic-endpoint[data-document-element="${uartInput.id}"]`).click();
+  assert.match(await page.locator('.semantic-details').innerText(),/所属元素[\s\S]*uart : Device/);
+  assert.equal(await page.locator('.semantic-edge-connect.is-connected').count(),1);
+  await page.locator('button[data-document-tab="outline"]').click();await page.locator('[data-document-search]').fill('flightSoftware');
+  assert.ok(await page.locator('.semantic-outline-row').count() > 0);
+  await page.locator('.semantic-outline-row').first().click();assert.equal(await page.locator('.source-line.is-highlighted').count(),1);
+  await page.locator('button[data-document-tab="diagram"]').click();await page.locator('[data-document-fit]').click();
+  const interconnectionBox = await page.locator('.semantic-svg').getAttribute('viewBox');
+  await page.locator('[data-document-zoom="in"]').click();assert.notEqual(await page.locator('.semantic-svg').getAttribute('viewBox'),interconnectionBox);
+  await page.locator('[data-document-fit]').click();assert.equal(await page.locator('.semantic-svg').getAttribute('viewBox'),interconnectionBox);
+  const canvas = await page.locator('.semantic-canvas').boundingBox();
+  await page.mouse.move(canvas.x+8,canvas.y+8);await page.mouse.down();await page.mouse.move(canvas.x+70,canvas.y+50);await page.mouse.up();
+  assert.notEqual(await page.locator('.semantic-svg').getAttribute('viewBox'),interconnectionBox);
+  await page.locator('[data-document-filter]').selectOption('structure');assert.ok(await page.locator('.semantic-edge-typing').count() > 0);
+  steps.push('generated model import, usage-port topology, edge details, keyboard selection, source navigation, search, drag and zoom');
+  const changed = generated.replace('part uart : Device;','part gateway : Device;').replaceAll('uart.input','gateway.input').replaceAll('uart.output','gateway.output').replace('connection sensorToUart connect sensor.output to gateway.input;','connection sensorToGateway connect gateway.input to sensor.output;');
+  const saved = await service.importModel({...args,content:changed,expectedHash:imported.model.sha256});
+  assert.equal(saved.imported,true);assert.notEqual(saved.model.sha256,imported.model.sha256);
+  const refreshed = await readGenerated();
+  await page.evaluate(options => viewer.update({...options,filter:'interconnection'}),refreshed);
+  await page.locator('[data-document-fit]').click();
+  assert.equal(await page.locator('.semantic-edge-connect').count(),3);
+  assert.match(await page.locator('.semantic-svg').textContent(),/sensorToGateway/);
+  assert.doesNotMatch(await page.locator('.semantic-svg').textContent(),/sensorToUart|uart : Device/);
+  assert.equal(await page.locator('.semantic-edge-connect [marker-end],.semantic-edge-connect [marker-start]').count(),0);
+  assert.match(await page.locator('.document-model-meta').innerText(),new RegExp(saved.model.sha256.slice(0,12)));
+  await page.screenshot({path:path.join(temporary,'interconnection-refreshed.png')});
+  await fs.writeFile(path.join(temporary,'refreshed-model.json'),JSON.stringify(refreshed,null,2));
+  steps.push('hash-guarded node and connection edit, save, fresh backend query and updated undirected diagram');
   await page.evaluate(markdown => {viewer.update({file:{path:'reports/run.md',content:markdown,mime:'text/markdown'},model:null,verification:null,tab:'preview'});},markdown);
   assert.equal(await page.locator('.document-markdown table').count(),1);assert.equal(await page.locator('.document-markdown ul ul').count(),1);assert.equal(await page.locator('.document-markdown img,.document-markdown script,.document-markdown iframe,.document-markdown svg').count(),0);assert.equal(await page.evaluate(() => window.pwned),undefined);
   await page.locator('[data-document-path="models/mission.sysml"]').click();assert.deepEqual(await page.evaluate(() => opened.at(-1)),{path:'models/mission.sysml',line:16});

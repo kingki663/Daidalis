@@ -85,7 +85,11 @@ MCP wrappers call the same service.
   reject stale/concurrent replacements.
 - `query`: a KerML expression evaluated by the real kernel, or the kernel's
   structured model/diagram graph when no expression is supplied. It is not
-  JavaScript or shell evaluation.
+  JavaScript or shell evaluation. The graph retains the tree-view `nodes` and
+  `edges` and adds an `interconnection` graph emitted by the same session.
+  Validation and import replies use this structure under `data.graph`.
+  Expression query results are unchanged. Viewer behavior and acceptance checks
+  are recorded in [model visualization improvements](model-visualization-improvements.md).
 - `validate`: returns findings with source spans, supported validation scope,
   exact input hash, runtime provenance and saved evidence.
 - `exportModel`: `sysml`, `compact-json`, `full-json`, or `plantuml`. PlantUML is
