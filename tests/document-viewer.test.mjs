@@ -218,6 +218,79 @@ test('invalid models retain source and structured diagnostics without synthesizi
   assert.match(renderDocumentViewer({...options,tab:'source'}),/part &lt;img onerror=bad&gt;/);
 });
 
+test('an unresolved draft remains drawable but the main diagram warns that it is only a partial result',() => {
+  const content = 'package Draft {\n    part sensor : MissingSensor;\n}', model = kernel('query',content);
+  assert.equal(model.valid,false);
+  assert.ok(model.findings.some(item => item.stage === 'referential'));
+  assert.ok(normalizeSemanticGraph(model,{view:'combined'}).nodes.length > 0);
+  for (const filter of ['structure','requirements','all']) {
+    const html = renderDocumentViewer({file:{path:'models/draft.sysml',content},model,filter});
+    assert.match(html,/部分结果/);
+    assert.match(html,/未通过语义校验/);
+    assert.match(html,/data-document-tab="diagnostics"[^>]*>查看诊断/);
+    if (filter !== 'requirements') assert.match(html,/class="semantic-svg"/);
+  }
+  const diagnostics = renderDocumentViewer({file:{path:'models/draft.sysml',content},model,tab:'diagnostics'});
+  assert.match(diagnostics,/MissingSensor/);
+  assert.match(diagnostics,/data-document-source-line="2"/);
+});
+
+test('diagram and diagnostics distinguish checked, unchecked and unavailable semantic results',() => {
+  const file = {path:'models/status.sysml',content:'part sensor;'}, data = {nodes:[{id:'sensor',metaclass:'PartUsage',label:'sensor'}],edges:[]};
+  const checked = renderDocumentViewer({file,model:{valid:true,findings:[],data}});
+  assert.doesNotMatch(checked,/部分结果|尚未取得语义校验结果|语义后端暂不可用/);
+  for (const model of [undefined,{valid:null,findings:[]},{data}]) {
+    const diagram = renderDocumentViewer({file,model}), diagnostics = renderDocumentViewer({file,model,tab:'diagnostics'});
+    assert.match(diagram,/尚未取得语义校验结果/);
+    assert.match(diagnostics,/尚未取得语义校验结果/);
+    assert.doesNotMatch(diagnostics,/没有发现错误|校验通过|模型包含需要检查的诊断/);
+  }
+  for (const model of [{available:false,valid:null,error:'Toolchain unavailable'},{backend:{available:false},data},{error:'Query failed',valid:false,data}]) {
+    const diagram = renderDocumentViewer({file,model});
+    assert.match(diagram,/语义后端暂不可用/);
+    assert.doesNotMatch(diagram,/部分结果|未通过语义校验/);
+  }
+  const empty = renderDocumentViewer({file,model:{valid:true,data:null}});
+  assert.doesNotMatch(empty,/<svg|部分结果|语义后端暂不可用|尚未取得语义校验结果/);
+});
+
+test('graph limits report edge-only truncation at 4801 edges in every graph view',() => {
+  const nodes = [{id:'sender',metaclass:'PartUsage',label:'sender'},{id:'receiver',metaclass:'PartUsage',label:'receiver'}];
+  for (const edgeCount of [4801,4800]) {
+    const edges = Array.from({length:edgeCount},(_,index) => ({id:'wire-' + index,source:'sender',target:'receiver',kind:'connect'}));
+    const data = {nodes,edges,interconnection:{nodes,edges}};
+    for (const view of ['structure','interconnection','combined']) {
+      const graph = normalizeSemanticGraph({data},{view});
+      assert.equal(graph.edges.length,4800);
+      assert.equal(graph.truncated,edgeCount > 4800,view);
+      assert.equal(graph.nodeCount,2);
+      assert.equal(graph.edgeCount,edgeCount);
+    }
+    for (const filter of ['structure','all']) {
+      const html = renderDocumentViewer({file:{path:'models/large.sysml'},model:{valid:true,data},filter});
+      if (edgeCount > 4800) {
+        assert.match(html,/图数据已截断/);
+        assert.match(html,/4800\s*\/\s*4801/);
+      } else assert.doesNotMatch(html,/已截断/);
+    }
+  }
+});
+
+test('node-only and combined limits preserve total graph counts and show a truncation notice',() => {
+  const nodes = Array.from({length:1201},(_,index) => ({id:'part-' + index,metaclass:'PartUsage',label:'Part ' + index}));
+  for (const edgeCount of [0,4801]) {
+    const edges = Array.from({length:edgeCount},(_,index) => ({id:'wire-' + index,source:'part-0',target:'part-1',kind:'connect'}));
+    const model = {valid:true,data:{nodes,edges}}, graph = normalizeSemanticGraph(model,{view:'combined'});
+    assert.equal(graph.nodes.length,1200);
+    assert.equal(graph.truncated,true);
+    assert.equal(graph.nodeCount,1201);
+    assert.equal(graph.edgeCount,edgeCount);
+    const html = renderDocumentViewer({file:{path:'models/large.sysml'},model});
+    assert.match(html,/图数据已截断/);
+    assert.match(html,/1200\s*\/\s*1201/);
+  }
+});
+
 test('viewer accepts file mime and JSON formats while bounding untrusted graph size',async () => {
   assert.equal(documentKind({mime:'text/markdown'}),'markdown');assert.equal(documentKind({path:'m.sysml'}),'sysml');
   assert.match(renderDocumentViewer({file:{name:'manifest.json',content:'{"a":1}'}}),/文件字段/);

@@ -242,7 +242,7 @@ export function normalizeSemanticGraph(model, {path = '', view = 'structure'} = 
     }
     raw = {nodes:[...nodes.values()],edges:[...edges.values()],view:'combined'};
   }
-  if (!Array.isArray(raw?.nodes) || !Array.isArray(raw?.edges)) return {nodes:[], rows:[], edges:[], truncated:false};
+  if (!Array.isArray(raw?.nodes) || !Array.isArray(raw?.edges)) return {nodes:[], rows:[], edges:[], nodeCount:0, edgeCount:0, truncated:false};
   const nodes = [], rows = [], ids = new Set();
   for (const item of raw.nodes.slice(0, MAX_GRAPH)) {
     if (!item || typeof item.id !== 'string' || ids.has(item.id)) continue;
@@ -260,7 +260,7 @@ export function normalizeSemanticGraph(model, {path = '', view = 'structure'} = 
     label:label(edge.label),qname:label(edge.qname),metaclass:label(edge.metaclass),file:edge.file || path,
     line:Number.isInteger(edge.line) && edge.line > 0 ? edge.line : null,col:Number.isInteger(edge.col) && edge.col > 0 ? edge.col : null
   }));
-  return {nodes, rows, edges, truncated:raw.nodes.length > MAX_GRAPH, source:'SysML semantic backend'};
+  return {nodes, rows, edges, nodeCount:raw.nodes.length, edgeCount:raw.edges.length, truncated:raw.nodes.length > MAX_GRAPH || raw.edges.length > MAX_GRAPH * 4, source:'SysML semantic backend'};
 }
 
 const structural = node => /Part|Port|Interface|Connection|Flow|Item|Action|State|Transition/i.test(node.metaclass);
@@ -475,10 +475,26 @@ function renderSource(content, kind) {
 }
 
 function locationOf(item) { const line = item.line || item.location?.line || item.range?.start?.line; return Number.isInteger(line) && line > 0 ? line : null; }
+function semanticCheckState(model) {
+  if (model?.available === false || model?.backend?.available === false || (model?.error && model.valid !== true)) return 'unavailable';
+  if (model?.valid === true) return 'valid';
+  return model?.valid === false ? 'invalid' : 'unchecked';
+}
+
+function renderDiagramNotices(model, graph) {
+  const state = semanticCheckState(model), findings = Array.isArray(model?.findings) ? model.findings : [], notices = [];
+  const diagnosticLink = `<button type="button" data-document-tab="diagnostics">查看诊断${findings.length ? `（${findings.length} 条）` : ''}</button>`;
+  if (state === 'invalid') notices.push(`<p>${graph.nodes.length ? '部分结果：模型未通过语义校验，图形可能不完整。' : '模型未通过语义校验，暂无可展示的语义图。'}${diagnosticLink}</p>`);
+  else if (state === 'unavailable') notices.push(`<p>SysML 语义后端暂不可用，当前文件未完成本次语义校验。${diagnosticLink}</p>`);
+  else if (state === 'unchecked') notices.push(`<p>尚未取得语义校验结果${graph.nodes.length ? '，当前图未经本次校验' : ''}。${diagnosticLink}</p>`);
+  if (graph.truncated) notices.push(`<p>图数据已截断：保留 ${graph.nodes.length} / ${graph.nodeCount} 个语义元素、${graph.edges.length} / ${graph.edgeCount} 条关系。展示上限为 ${MAX_GRAPH} 个元素、${MAX_GRAPH * 4} 条关系。</p>`);
+  return notices.length ? `<div class="document-model-notices" role="status" aria-label="模型图状态">${notices.join('')}</div>` : '';
+}
+
 function renderDiagnostics(model) {
-  const findings = Array.isArray(model?.findings) ? model.findings : [];
-  if (!model) return '<div class="document-empty">尚未读取语义校验结果。</div>';
-  if (model.available === false || model.backend?.available === false || (model.error && model.valid !== true)) return `<div class="document-diagnostics"><p class="document-check-state has-findings">SysML 语义后端暂不可用</p><p>${esc(model.error || model.detail || model.backend?.detail || '尚未取得校验结果。')}</p><p class="document-scope">当前文件未完成本次语义校验，可以继续查看源码。</p></div>`;
+  const findings = Array.isArray(model?.findings) ? model.findings : [], state = semanticCheckState(model);
+  if (state === 'unchecked') return '<div class="document-empty">尚未取得语义校验结果。可以继续查看源码。</div>';
+  if (state === 'unavailable') return `<div class="document-diagnostics"><p class="document-check-state has-findings">SysML 语义后端暂不可用</p><p>${esc(model.error || model.detail || model.backend?.detail || '尚未取得校验结果。')}</p><p class="document-scope">当前文件未完成本次语义校验，可以继续查看源码。</p></div>`;
   return `<div class="document-diagnostics"><p class="document-check-state ${model.valid === true ? 'is-valid' : 'has-findings'}">${model.valid === true ? '语法、引用及支持的语义规则校验通过' : '模型包含需要检查的诊断'}</p>${findings.length ? findings.map(item => `<article class="document-finding"><div><span class="document-status ${attr(item.severity === 'error' ? 'violated' : 'undecided')}">${esc(item.severity || 'finding')}</span><strong>${esc(item.message || item.detail || item.code || '模型诊断')}</strong></div><p>${esc(item.stage || '')}</p>${locationOf(item) ? `<button type="button" data-document-source-line="${locationOf(item)}">查看第 ${locationOf(item)} 行</button>` : ''}</article>`).join('') : '<p>没有发现错误或未解析的引用。</p>'}<p class="document-scope">Open-MBEE SysML v2 · 支持规则范围内的校验；仿真结果单独记录。</p></div>`;
 }
 
@@ -527,7 +543,7 @@ export function renderDocumentViewer({file = {},model,verification,tab,filter = 
     body = imageURL ? `<div class="document-raster-view"><img src="${attr(imageURL)}" alt="${attr(file.name || basename(file.path) || '工程图片')}" class="document-raster-image"><span>${esc(file.name || basename(file.path))}</span></div>` : '<div class="document-empty">暂时无法预览此图片。请检查文件是否存在或选择受支持的图片格式。</div>';
   }
   else if (kind === 'unsupported') body = '<div class="document-empty">此文件格式暂不支持应用内预览。请在文件列表中选择文档、SysML 模型或图片。</div>';
-  else if (isModel && effectiveTab === 'diagram') body = graph.nodes.length ? renderDiagram(graph,filter) : `<div class="document-empty">${model?.valid === false ? '模型存在诊断，暂时无法生成语义图。请查看诊断或源码。' : '尚未加载 SysML 语义模型。请稍后重试或查看源码。'}</div>`;
+  else if (isModel && effectiveTab === 'diagram') body = renderDiagramNotices(model,graph) + (graph.nodes.length ? renderDiagram(graph,filter) : '<div class="document-empty">当前没有可展示的语义图。可以查看诊断或源码。</div>');
   else if (isModel && effectiveTab === 'outline') body = renderOutline(graph);
   else if (isModel && effectiveTab === 'diagnostics') body = renderDiagnostics(model);
   else if (isModel && effectiveTab === 'constraints') body = renderConstraints(normalizeSemanticGraph(model,{path:file.path}),verification,model);
